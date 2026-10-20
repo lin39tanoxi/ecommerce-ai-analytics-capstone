@@ -1,0 +1,117 @@
+@startuml
+title 商城系统下单到退款数据流（UML 时序图）
+
+autonumber
+hide footbox
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+
+actor "顾客" as CUSTOMER
+actor "管理员" as MANAGER
+
+box "商城系统" #EAF3FF
+  boundary "商城前台" as WEB
+  boundary "后台管理前端" as ADMINWEB
+  control "API 网关" as GATEWAY
+  control "购物车服务\nCart" as CART
+  control "营销服务\nSMS" as PROMOTION
+  control "库存服务\nWMS" as INVENTORY
+  control "订单与售后服务\nOMS" as ORDER
+  control "支付服务\nPayment" as PAYMENT
+  queue "RabbitMQ" as MQ
+  database "MySQL 主库\n业务 schema" as PRIMARY
+end box
+
+box "问数侧部署环境（副本与应用分别运行）" #EAF7EA
+  database "MySQL 只读副本\n获准业务表列与语义视图" as REPLICA
+  control "语义层与 SQL 生成/校验" as QUERY
+  boundary "结果解释与可视化页面" as RESULT
+end box
+
+== 一、提交订单 ==
+CUSTOMER -> WEB : 选择商品、地址和优惠券，提交订单
+WEB -> GATEWAY : 创建订单请求
+GATEWAY -> ORDER : 创建订单
+ORDER -> CART : 读取已选购物车项
+CART --> ORDER : SKU、数量
+ORDER -> PROMOTION : 校验活动与优惠券，计算优惠
+PROMOTION --> ORDER : 优惠明细与应付金额
+ORDER -> INVENTORY : 按 SKU 和数量预占库存
+INVENTORY -> INVENTORY : 库存库写入预占记录
+INVENTORY --> ORDER : 预占成功
+ORDER -> ORDER : 订单库写入待支付订单、订单明细和价格快照
+ORDER -> PAYMENT : 创建待支付单
+PAYMENT -> PAYMENT : 支付库写入支付单
+PAYMENT --> ORDER : 支付单号
+ORDER -> CART : 清除已结算购物车项
+ORDER --> GATEWAY : 订单号、应付金额、待支付状态
+GATEWAY --> WEB : 返回订单信息
+WEB --> CUSTOMER : 展示待支付订单
+
+note over ORDER,INVENTORY
+  下单失败或支付超时：取消订单并释放预占库存；
+  重复请求需按订单号幂等处理。
+end note
+
+== 二、模拟支付成功 ==
+CUSTOMER -> WEB : 确认支付
+WEB -> GATEWAY : 支付请求
+GATEWAY -> PAYMENT : 模拟支付
+PAYMENT -> PAYMENT : 支付库记录实付金额、支付时间和成功状态
+PAYMENT -> MQ : 发布支付成功事件
+MQ -> ORDER : 幂等更新订单为已支付
+ORDER -> ORDER : 订单库保存支付状态
+MQ -> INVENTORY : 确认预占库存扣减
+INVENTORY -> INVENTORY : 库存库更新可售/锁定数量
+MQ -> PROMOTION : 确认优惠券使用
+PAYMENT --> GATEWAY : 支付成功
+GATEWAY --> WEB : 返回支付结果
+WEB --> CUSTOMER : 展示已支付订单
+
+== 三、申请与处理退款 ==
+CUSTOMER -> WEB : 提交退款申请（商品、金额、原因）
+WEB -> GATEWAY : 退款申请请求
+GATEWAY -> ORDER : 创建售后申请
+ORDER -> ORDER : 校验可退金额；订单库写入待审核申请
+ORDER --> GATEWAY : 申请编号、待审核状态
+GATEWAY --> WEB : 返回申请结果
+
+MANAGER -> ADMINWEB : 审核退款申请
+ADMINWEB -> GATEWAY : 提交审核结果
+GATEWAY -> ORDER : 处理售后申请
+alt 审核通过
+  ORDER -> PAYMENT : 发起退款（申请编号、可退金额）
+  PAYMENT -> PAYMENT : 支付库写入退款流水和实际退款金额
+  PAYMENT -> MQ : 发布退款成功事件
+  MQ -> ORDER : 幂等更新售后单与订单退款状态
+  ORDER -> ORDER : 订单库累计已退金额
+  opt 退货退款且商品验收入库
+    ORDER -> INVENTORY : 回补对应 SKU 库存
+    INVENTORY -> INVENTORY : 库存库写入回补记录
+  end
+else 审核驳回
+  ORDER -> ORDER : 订单库记录驳回原因和状态
+end
+ORDER --> GATEWAY : 返回最终处理状态
+GATEWAY --> ADMINWEB : 展示审核结果
+
+== 四、持续复制与问数查询（贯穿前三阶段） ==
+note over PRIMARY,REPLICA
+  上述各服务提交到主库的新增、修改、删除，
+  持续通过 binlog 异步应用到副本；
+  此处集中画出复制链路，不表示退款后才开始同步。
+end note
+PRIMARY -> REPLICA : binlog(ROW) / GTID 持续异步复制
+QUERY -> QUERY : 注入指标口径与字段语义，生成并校验只读 SQL
+QUERY -> REPLICA : 只读查询获准表列与语义视图
+REPLICA --> QUERY : 返回查询结果
+QUERY -> QUERY : 结合复制状态给出数据时效提示
+QUERY -> RESULT : 自然语言解释与 HTML 可视化
+
+note right of REPLICA
+  不允许问数账号 INSERT / UPDATE / DELETE；
+  主库删除会传播至副本，副本不是历史档案。
+  异步复制可能有短暂延迟；副本故障不回退主库。
+end note
+
+@enduml

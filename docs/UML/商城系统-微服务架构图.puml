@@ -1,0 +1,92 @@
+@startuml
+title 商城与问数系统总体架构（UML 组件图）
+
+left to right direction
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam linetype ortho
+
+actor "顾客" as CUSTOMER
+actor "管理员" as OPERATOR
+
+package "商城系统（独立部署）" {
+  rectangle "商城前台" as STOREFRONT
+  rectangle "后台管理前端" as ADMINFRONT
+  node "Nginx\n反向代理" as NGINX
+  component "API 网关\nSpring Cloud Gateway" as GATEWAY
+
+  package "业务微服务" as SERVICES {
+    component "认证服务\nAuth" as AUTH
+    component "会员服务\nUMS" as MEMBER
+    component "商品服务\nPMS" as PRODUCT
+    component "搜索服务\nSearch" as SEARCH
+    component "购物车服务\nCart" as CART
+    component "营销与秒杀服务\nSMS" as PROMOTION
+    component "库存服务\nWMS" as INVENTORY
+    component "订单与售后服务\nOMS" as ORDER
+    component "支付服务\nPayment" as PAYMENT
+    component "后台管理与内容服务\nAdmin" as ADMIN
+  }
+
+  package "基础设施与中间件" as INFRA {
+    node "Nacos\n服务注册与配置" as NACOS
+    node "Sentinel\n限流与熔断" as SENTINEL
+    node "Zipkin\n链路追踪" as ZIPKIN
+    node "Seata\n跨服务事务协调" as SEATA
+    node "Redis\n缓存、购物车、秒杀" as REDIS
+    queue "RabbitMQ\n异步业务事件" as MQ
+    node "Elasticsearch\n商品搜索索引" as ES
+    database "MySQL 主库\n同一实例、按服务分 schema" as MYSQL
+  }
+}
+
+package "问数侧部署环境" {
+  database "MySQL 只读副本\n独立实例、持久化运行" as REPLICA
+  package "问数应用（独立开发与部署）" {
+    component "语义层\n指标口径、获准表列与视图" as SEMANTIC
+    component "Text-to-SQL\n生成、校验、自纠错" as TEXTSQL
+    component "结果解释与可视化" as VISUAL
+  }
+}
+
+CUSTOMER --> STOREFRONT
+OPERATOR --> ADMINFRONT
+STOREFRONT --> NGINX
+ADMINFRONT --> NGINX
+NGINX --> GATEWAY
+
+GATEWAY --> SERVICES : 统一路由与认证
+
+SERVICES --> INFRA : 数据存储、消息与服务治理
+GATEWAY ..> INFRA : 注册发现、限流与追踪
+
+MYSQL --> REPLICA
+SEMANTIC --> TEXTSQL : 提供可查询范围与业务口径
+TEXTSQL --> REPLICA
+TEXTSQL --> VISUAL : 查询结果
+
+note bottom of SERVICES
+  主要业务调用：订单服务协调购物车、商品、
+  营销和库存；支付结果更新订单状态。
+end note
+
+note bottom of INFRA
+  MySQL：各服务独立 schema，同一物理实例；
+  Redis：缓存、购物车、秒杀；
+  RabbitMQ：异步事件；Elasticsearch：商品搜索；
+  Nacos、Sentinel、Zipkin、Seata：服务治理与事务。
+end note
+
+note right of REPLICA
+  副本部署在问数侧，作为独立 MySQL 实例运行；
+  首次一致性初始化，之后按 binlog(ROW)/GTID
+  持续异步应用主库变更。
+  商城只向主库写入；新增、修改和删除均随复制传播。
+  副本可能短暂落后，需监控延迟；问数账号仅能
+  读取获准业务表非敏感列与语义视图，
+  不调用商城微服务。
+  副本不可用时问数服务报错，不回退查询主库。
+  若业务库分布于不同 MySQL 实例，需改用 CDC 汇聚。
+end note
+
+@enduml

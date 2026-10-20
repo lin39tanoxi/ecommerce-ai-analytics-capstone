@@ -1,0 +1,121 @@
+@startuml
+title 商城下单到退款的数据流总览（UML 活动图）
+
+skinparam shadowing false
+skinparam activity {
+  BackgroundColor #F7FAFF
+  BorderColor #52657A
+}
+
+start
+
+partition "顾客 / 商城前台" {
+  :提交订单\n用户、SKU、数量、优惠券;
+}
+
+partition "订单服务 OMS" {
+  :读取购物车项和商品价格快照;
+  :请求营销服务核算优惠;
+}
+
+partition "库存服务 WMS" {
+  :预占库存\n库存库记录锁定数量;
+}
+
+if (优惠有效且库存足够？) then (是)
+  partition "订单服务 OMS" {
+    :订单库写入待支付订单、\n明细和应付金额;
+  }
+  partition "支付服务 Payment" {
+    :支付库创建待支付单;
+  }
+else (否)
+  partition "订单服务 OMS" {
+    :拒绝下单并释放已预占库存;
+  }
+  stop
+endif
+
+partition "顾客 / 商城前台" {
+  :确认模拟支付;
+}
+
+partition "支付服务 Payment" {
+  :支付库记录实付金额、时间和成功状态;
+}
+
+partition "RabbitMQ" {
+  :发布支付成功事件;
+}
+
+fork
+  partition "订单服务 OMS" {
+    :订单库更新为已支付;
+  }
+fork again
+  partition "库存服务 WMS" {
+    :确认预占库存扣减;
+  }
+fork again
+  partition "营销服务 SMS" {
+    :确认优惠券使用;
+  }
+end fork
+
+partition "顾客 / 商城前台" {
+  :提交退款申请\n商品、申请金额、原因;
+}
+
+partition "订单服务 OMS" {
+  :校验可退金额；\n订单库写入待审核售后单;
+}
+
+partition "后台管理" {
+  :审核退款申请;
+}
+
+if (审核通过？) then (是)
+  partition "支付服务 Payment" {
+    :支付库写入实际退款流水;
+  }
+  partition "RabbitMQ" {
+    :发布退款成功事件;
+  }
+  partition "订单服务 OMS" {
+    :累计已退金额，更新售后与订单状态;
+  }
+  if (退货商品验收入库？) then (是)
+    partition "库存服务 WMS" {
+      :库存库记录回补数量;
+    }
+  endif
+else (否)
+  partition "订单服务 OMS" {
+    :订单库记录驳回原因和状态;
+  }
+endif
+
+partition "商城侧 MySQL 主库" {
+  :提交的业务变更写入 binlog（ROW / GTID）;
+}
+
+partition "问数侧 MySQL 只读副本" {
+  :独立实例持续接收并应用主库变更;
+}
+
+partition "独立问数系统" {
+  :依据指标口径与字段语义生成并校验 SELECT;
+  :以只读账号查询副本中的获准业务表列与语义视图;
+  :解释结果并生成可视化页面;
+}
+
+note right
+  复制贯穿下单、支付、退款全过程，并非退款后才启动；
+  副本由问数侧部署环境持续运行和监控；
+  主库的增改删都会传播，查询可能存在短暂延迟；
+  副本不可用时问数失败，不回退查询主库；
+  问数系统不调用商城微服务，也不写入副本。
+end note
+
+stop
+@enduml
